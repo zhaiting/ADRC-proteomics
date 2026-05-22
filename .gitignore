@@ -1,0 +1,28 @@
+# Local input data — provide your own; never committed
+data/*
+biomarker_data/*
+
+# Cohort files with participant identifiers — keep real files out of the repo.
+# Only the .example templates and the folder README are tracked.
+private/*
+!private/*.example
+!private/README.md
+
+# Generated analysis outputs
+outputs/*
+correlation/figures/*
+correlation/*.csv
+correlation/heatmap_*.pdf
+correlation/top_pair_plots_*/
+pathway_analysis/results/*
+
+# Local config copy
+proteome_association/config.yml
+
+# R / editor / OS cruft
+.Rhistory
+.RData
+.Rproj.user/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,33 @@
+paths:
+  root_dir: "."
+  data_dir: "data"
+  output_base: "outputs"
+  expression_file: "sample_protein_expression.csv"
+  sample_metadata_file: "sample_metadata.csv"
+  demographics_file: "sample_demographics.xlsx"
+  protein_metadata_file: "protein_metadata.csv"
+  panel_file: null
+  output_dir: null
+
+analysis:
+  group_mode: "individual"
+  min_baseline_age: 55
+  sex_filter: "all"
+  subject_id_field: "local_subject_id_column"
+  exclude_subject_ids_file: "private/exclude_subject_ids.txt"
+  exclude_subject_ids: null
+  save_fit: true
+  n_cores: 1
+
+plots:
+  run_full_volcano: true
+  run_panel_volcano: true
+  p_threshold: 0.05
+  log2fc_guide: 0.1375035
+  color_higher: "#D55E00"
+  color_lower: "#0072B2"
+  color_neutral: "#a6adb7"
+
+test:
+  test_n_somakeys: null
+  test_panel_somakeys_per_panel: 20

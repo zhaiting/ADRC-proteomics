@@ -1,0 +1,924 @@
+---
+title: "Protein x AD biomarker correlation"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(lmerTest)
+library(broom.mixed)
+library(pheatmap)
+ROOT <- normalizePath("..")
+DATA_DIR <- file.path(ROOT, "data")
+OUT_BASE <- file.path(ROOT, "outputs")
+BIOMARKER_DIR <- file.path(ROOT, "biomarker_data")
+Sys.setenv(VROOM_CONNECTION_SIZE = 2^24)
+PRIVATE_DIR <- file.path(ROOT, "private")
+required_setting <- function(name) {
+  value <- Sys.getenv(name, unset = "")
+  if (!nzchar(value)) {
+    stop("Set ", name, " to the matching local input value.")
+  }
+  value
+}
+read_private_ids <- function(env_name, default_file) {
+  value <- Sys.getenv(env_name, unset = "")
+  path <- if (nzchar(value)) value else default_file
+  if (!file.exists(path)) return(character())
+  ids <- trimws(readLines(path, warn = FALSE))
+  ids[nzchar(ids)]
+}
+read_private_fixes <- function(env_name, default_file) {
+  value <- Sys.getenv(env_name, unset = "")
+  path <- if (nzchar(value)) value else default_file
+  if (!file.exists(path)) {
+    return(tibble(source = character(), id = character(),
+                  match_draw_date = as.Date(character()),
+                  only_if_visit_missing = logical(),
+                  visit_n = integer(), draw_date = as.Date(character())))
+  }
+  fixes <- read_csv(path, show_col_types = FALSE)
+  if (!"match_draw_date" %in% names(fixes) && "draw_date" %in% names(fixes)) {
+    fixes <- rename(fixes, match_draw_date = draw_date)
+  }
+  if (!"only_if_visit_missing" %in% names(fixes)) {
+    fixes$only_if_visit_missing <- FALSE
+  }
+  if (!"draw_date" %in% names(fixes)) {
+    fixes$draw_date <- NA_character_
+  }
+  fixes %>%
+    transmute(
+      source = as.character(source),
+      id = as.character(id),
+      match_draw_date = as.Date(match_draw_date),
+      only_if_visit_missing = as.logical(only_if_visit_missing),
+      visit_n = as.integer(visit_n),
+      draw_date = as.Date(draw_date)
+    )
+}
+apply_private_fixes <- function(df, fixes, source_name) {
+  fixes <- fixes %>% filter(source == source_name)
+  if (nrow(fixes) == 0L) return(df)
+  for (i in seq_len(nrow(fixes))) {
+    idx <- df$biomarker_subject_id == fixes$id[i]
+    if (!is.na(fixes$match_draw_date[i])) {
+      idx <- idx & df$draw_date == fixes$match_draw_date[i]
+    }
+    if (isTRUE(fixes$only_if_visit_missing[i])) {
+      idx <- idx & is.na(df$visit_n)
+    }
+    idx[is.na(idx)] <- FALSE
+    if (!is.na(fixes$visit_n[i])) {
+      df$visit_n[idx] <- fixes$visit_n[i]
+    }
+    if (!is.na(fixes$draw_date[i])) {
+      df$draw_date[idx] <- fixes$draw_date[i]
+    }
+  }
+  df
+}
+SUBJECT_ID_FIELD <- required_setting("SUBJECT_ID_FIELD")
+BIOMARKER_ID_FIELD <- required_setting("BIOMARKER_ID_FIELD")
+BIOMARKER_STUDY_FILTER <- Sys.getenv("BIOMARKER_STUDY_FILTER", unset = "")
+EXPRESSION_FILE <- required_setting("CORRELATION_EXPRESSION_FILE")
+SAMPLE_METADATA_FILE <- required_setting("CORRELATION_SAMPLE_METADATA_FILE")
+DEMOGRAPHICS_FILE <- required_setting("CORRELATION_DEMOGRAPHICS_FILE")
+PROTEIN_METADATA_FILE <- required_setting("CORRELATION_PROTEIN_METADATA_FILE")
+BIOMARKER_TAU181_FILE <- required_setting("CORRELATION_TAU181_FILE")
+BIOMARKER_TAU217_FILE <- required_setting("CORRELATION_TAU217_FILE")
+EXCLUDE_SUBJECT_IDS <- read_private_ids(
+  "EXCLUDE_SUBJECT_IDS_FILE",
+  file.path(PRIVATE_DIR, "exclude_subject_ids.txt")
+)
+BIOMARKER_VISIT_FIXES <- read_private_fixes(
+  "CORRELATION_BIOMARKER_VISIT_FIXES",
+  file.path(PRIVATE_DIR, "correlation_biomarker_visit_fixes.csv")
+)
+MIN_BASELINE_AGE <- 55
+AGE_TERMS <- c("age_baseline", "age_delta")
+RUN_GROUP_SENSITIVITY <- TRUE
+RUN_AB_RATIO_RAW_SENSITIVITY <- TRUE
+BIO <- c("PlasmaPTau181", "PlasmaAB142P", "PlasmaAB140P", "PlasmaABRatio",
+         "PTau217", "GFAP", "NfL")
+```
+
+```{r load-raw, message=FALSE, warning=FALSE}
+expr_raw <- read_csv(
+  file.path(DATA_DIR, EXPRESSION_FILE),
+  show_col_types = FALSE
+)
+
+smeta <- read_csv(
+  file.path(DATA_DIR, SAMPLE_METADATA_FILE),
+  show_col_types = FALSE, guess_max = 5000, name_repair = "unique"
+)
+sid_cols <- grep("^SampleId", names(smeta), value = TRUE)
+if (length(sid_cols) > 1) {
+  stopifnot(identical(as.character(smeta[[sid_cols[1]]]),
+                      as.character(smeta[[sid_cols[2]]])))
+  smeta[[sid_cols[2]]] <- NULL
+  names(smeta)[names(smeta) == sid_cols[1]] <- "SampleId"
+}
+
+demo <- read_excel(file.path(DATA_DIR, DEMOGRAPHICS_FILE))
+protein_dict <- read_csv(
+  file.path(DATA_DIR, PROTEIN_METADATA_FILE),
+  show_col_types = FALSE
+)
+tau181_raw <- read_excel(
+  file.path(BIOMARKER_DIR, BIOMARKER_TAU181_FILE),
+  sheet = "Combined_Data"
+)
+if (nzchar(BIOMARKER_STUDY_FILTER) && "Study" %in% names(tau181_raw)) {
+  tau181_raw <- tau181_raw %>% filter(Study == BIOMARKER_STUDY_FILTER)
+}
+tau217_raw <- read_excel(
+  file.path(BIOMARKER_DIR, BIOMARKER_TAU217_FILE)
+)
+
+expr_raw$SampleId <- as.character(expr_raw$SampleId)
+smeta$SampleId    <- as.character(smeta$SampleId)
+demo$SampleId     <- as.character(demo$SampleId)
+```
+
+```{r expr-qc}
+soma_cols <- grep("^SL[0-9]", names(expr_raw), value = TRUE)
+stopifnot(length(soma_cols) >= 7000)
+qc_pass_ids     <- smeta$SampleId[smeta$RowCheck == "PASS"]
+sample_only_ids <- smeta$SampleId[smeta$SampleType == "Sample"]
+keep_ids        <- intersect(qc_pass_ids, sample_only_ids)
+
+expr <- expr_raw %>% filter(SampleId %in% keep_ids)
+soma_mat_raw <- as.matrix(expr[, soma_cols])
+rownames(soma_mat_raw) <- expr$SampleId
+stopifnot(all(!is.na(soma_mat_raw)), all(soma_mat_raw > 0))
+
+log2_long   <- log2(soma_mat_raw)
+log2_byid   <- rowsum(log2_long, group = rownames(log2_long), reorder = TRUE)
+counts_byid <- as.numeric(table(rownames(log2_long))[rownames(log2_byid)])
+log2_avg    <- log2_byid / counts_byid
+expr_long <- as_tibble(log2_avg, rownames = "SampleId")
+protein_label_map <- protein_dict %>%
+  distinct(SomaKey, Target, EntrezGeneSymbol) %>%
+  mutate(Target = if_else(is.na(Target) | Target == "", SomaKey, Target))
+```
+
+```{r covar}
+demo_u <- demo %>%
+  filter(SampleId %in% expr_long$SampleId) %>%
+  distinct(SampleId, .keep_all = TRUE) %>%
+  mutate(source_subject_id = as.character(.data[[SUBJECT_ID_FIELD]]),
+         Visit_int   = as.integer(Visit))
+
+covar <- demo_u %>%
+  filter(!(source_subject_id %in% EXCLUDE_SUBJECT_IDS)) %>%
+  mutate(
+    Sex          = factor(Sex),
+    SubjectID    = factor(paste0("S", match(source_subject_id,
+                                            unique(source_subject_id)))),
+    age_at_visit = as.numeric(Age_years),
+    group_combined = case_when(
+      Diagnosis_group == "HC"                 ~ "HC",
+      Diagnosis_group %in% c("MCI", "AD")     ~ "AD_spectrum",
+      Diagnosis_group == "PD"                 ~ "PD",
+      Diagnosis_group %in% c("MCI-PD", "LBD") ~ "LB_spectrum",
+      TRUE                                     ~ NA_character_
+    ),
+    group_combined = factor(group_combined,
+                            levels = c("HC","AD_spectrum","PD","LB_spectrum")),
+    group_individual = case_when(
+      Diagnosis_group %in% c("HC","MCI","AD","PD","LBD") ~ Diagnosis_group,
+      Diagnosis_group == "MCI-PD"                          ~ "MCI_PD",
+      TRUE                                                  ~ NA_character_
+    ),
+    group_individual = factor(group_individual,
+                              levels = c("HC","MCI","AD","PD","MCI_PD","LBD"))
+  ) %>%
+  select(-source_subject_id) %>%
+  filter(!is.na(group_individual), !is.na(age_at_visit), !is.na(Sex))
+covar <- covar %>%
+  group_by(SubjectID) %>%
+  mutate(
+    age_baseline = min(age_at_visit, na.rm = TRUE),
+    age_delta    = age_at_visit - age_baseline
+  ) %>%
+  ungroup()
+if (!is.na(MIN_BASELINE_AGE)) {
+  base_age <- covar %>% distinct(SubjectID, baseline_age = age_baseline)
+  keep_subj <- base_age$SubjectID[base_age$baseline_age >= MIN_BASELINE_AGE]
+  covar <- covar %>% filter(SubjectID %in% keep_subj)
+}
+covar$group_individual <- droplevels(covar$group_individual)
+covar$group_combined   <- droplevels(covar$group_combined)
+covar$Sex              <- droplevels(covar$Sex)
+print(covar %>% count(group_individual))
+print(covar %>% count(group_combined))
+```
+
+```{r bio-harmonize}
+tau217 <- tau217_raw %>%
+  mutate(
+    biomarker_subject_id = as.character(.data[[BIOMARKER_ID_FIELD]]),
+    visit_n     = case_when(
+      Year == "Y" ~ 1L,
+      str_detect(Year, "^Y\\d+$") ~ as.integer(str_remove(Year, "^Y")),
+      TRUE        ~ NA_integer_
+    ),
+    draw_date   = as.Date(Blood_Draw_Date)
+  ) %>%
+  apply_private_fixes(BIOMARKER_VISIT_FIXES, "tau217") %>%
+  filter(!is.na(biomarker_subject_id), !is.na(visit_n)) %>%
+  arrange(biomarker_subject_id, visit_n, is.na(draw_date), draw_date) %>%
+  group_by(biomarker_subject_id, visit_n) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(biomarker_subject_id, visit_n, PTau217, GFAP, NfL)
+tau181 <- tau181_raw %>%
+  mutate(
+    Sample_ID   = str_squish(Sample_ID),
+    biomarker_subject_id = str_extract(Sample_ID, "^\\d+"),
+    visit_n     = case_when(
+      str_detect(Sample_ID, "\\bY\\d+\\b") ~ as.integer(str_extract(Sample_ID, "(?<=\\bY)\\d+")),
+      str_detect(Sample_ID, "\\bY\\b")     ~ 1L,
+      TRUE                                  ~ NA_integer_
+    ),
+    draw_date   = lubridate::mdy(str_extract(Sample_ID, "\\d{1,2}/\\d{1,2}/\\d{2,4}"))
+  ) %>%
+  apply_private_fixes(BIOMARKER_VISIT_FIXES, "tau181") %>%
+  filter(!is.na(biomarker_subject_id), !is.na(visit_n)) %>%
+  arrange(biomarker_subject_id, visit_n, is.na(draw_date), draw_date) %>%
+  group_by(biomarker_subject_id, visit_n) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(biomarker_subject_id, visit_n, PlasmaPTau181, PlasmaAB142P, PlasmaAB140P, PlasmaABRatio)
+
+bio_long <- full_join(tau181, tau217, by = c("biomarker_subject_id", "visit_n"))
+demo_bridge <- demo %>%
+  distinct(
+    SampleId,
+    biomarker_subject_id = as.character(.data[[BIOMARKER_ID_FIELD]]),
+    Visit = as.integer(Visit)
+  )
+
+bio_with_sample <- bio_long %>%
+  inner_join(demo_bridge,
+             by = c("biomarker_subject_id" = "biomarker_subject_id",
+                    "visit_n" = "Visit")) %>%
+  rename(visit_n_int = visit_n)
+message(sprintf("Biomarker rows: %d / Bridged to demo: %d (%.1f%%)",
+                nrow(bio_long), nrow(bio_with_sample),
+                100 * nrow(bio_with_sample) / max(1L, nrow(bio_long))))
+```
+
+```{r assemble}
+samp_tbl <- covar %>%
+  left_join(bio_with_sample %>% select(SampleId, all_of(BIO)),
+            by = "SampleId") %>%
+  inner_join(expr_long, by = "SampleId")
+
+stopifnot(nrow(samp_tbl) == nrow(covar))
+bio_cov <- tibble(biomarker = BIO,
+                  n_with_value = vapply(BIO, function(b) sum(!is.na(samp_tbl[[b]])), 0L))
+print(bio_cov)
+samp_tbl_bio <- samp_tbl %>% filter(if_any(all_of(BIO), ~ !is.na(.x)))
+message(sprintf("Samples with >=1 biomarker value: %d (subjects: %d)",
+                nrow(samp_tbl_bio),
+                length(unique(samp_tbl_bio$SubjectID))))
+```
+
+```{r discovery-helpers}
+read_dream_toptable <- function(path, comparison, source_label,
+                                sex_label = NA_character_) {
+  if (!file.exists(path)) return(tibble())
+  readr::read_csv(path, show_col_types = FALSE) %>%
+    transmute(
+      SomaKey,
+      label          = if_else(is.na(Target) | Target == "", SomaKey, Target),
+      logFC, P.Value,
+      q_disc         = adj.P.Val,
+      comparison     = comparison,
+      comparison_key = str_replace_all(comparison, "[^A-Za-z0-9]+", "_") %>%
+                       str_replace_all("^_|_$", ""),
+      source         = source_label,
+      sex            = sex_label,
+      EntrezGeneSymbol
+    )
+}
+COMBINED_MAP <- list(
+  "AD_spectrum vs HC" = "toptable_AD_spectrum_vs_HC.csv",
+  "LB_spectrum vs HC" = "toptable_LB_spectrum_vs_HC.csv",
+  "PD vs HC"          = "toptable_PD_vs_HC.csv"
+)
+INDIV_MAP <- list(
+  "AD vs HC"     = "toptable_AD_vs_HC.csv",
+  "MCI vs HC"    = "toptable_MCI_vs_HC.csv",
+  "MCI-PD vs HC" = "toptable_MCI_PD_vs_HC.csv",
+  "LBD vs HC"    = "toptable_LBD_vs_HC.csv",
+  "PD vs HC"     = "toptable_PD_vs_HC.csv"
+)
+load_dream_set <- function(base_dir, contrast_map, source_label,
+                           sex_label = NA_character_) {
+  if (!dir.exists(base_dir)) {
+    message("  [skip] missing dir: ", base_dir)
+    return(tibble())
+  }
+  rows <- map_dfr(names(contrast_map), function(comp) {
+    p <- file.path(base_dir, contrast_map[[comp]])
+    if (!file.exists(p)) {
+      message("  [skip] missing toptable: ", p)
+      return(tibble())
+    }
+    read_dream_toptable(p, comparison = comp, source_label = source_label,
+                        sex_label = sex_label)
+  })
+  rows
+}
+```
+
+```{r discovery-load, message=TRUE}
+DREAM_COMB <- file.path(OUT_BASE, "dream_combined_baseAge55")
+DREAM_IND  <- file.path(OUT_BASE, "dream_individual_baseAge55")
+DREAM_COMB_F <- file.path(OUT_BASE, "dream_combined_baseAge55_sexF")
+DREAM_COMB_M <- file.path(OUT_BASE, "dream_combined_baseAge55_sexM")
+DREAM_IND_F  <- file.path(OUT_BASE, "dream_individual_baseAge55_sexF")
+DREAM_IND_M  <- file.path(OUT_BASE, "dream_individual_baseAge55_sexM")
+
+dream_combined <- load_dream_set(DREAM_COMB, COMBINED_MAP, "combined")
+dream_individual <- load_dream_set(DREAM_IND, INDIV_MAP, "individual")
+dream_comb_F <- load_dream_set(DREAM_COMB_F, COMBINED_MAP, "combined_sex", "F")
+dream_comb_M <- load_dream_set(DREAM_COMB_M, COMBINED_MAP, "combined_sex", "M")
+dream_ind_F  <- load_dream_set(DREAM_IND_F,  INDIV_MAP,    "individual_sex", "F")
+dream_ind_M  <- load_dream_set(DREAM_IND_M,  INDIV_MAP,    "individual_sex", "M")
+
+if (nrow(dream_ind_M) + nrow(dream_comb_M) == 0L) {
+  message(">>> Sex-stratified MALE outputs not present yet. ",
+          "Skipping sex_M discovery layer for this run.")
+}
+
+dream_all <- bind_rows(dream_combined, dream_individual,
+                       dream_comb_F, dream_comb_M,
+                       dream_ind_F, dream_ind_M)
+message(sprintf("Loaded %d dream toptable rows across %d sources.",
+                nrow(dream_all), n_distinct(dream_all$source)))
+```
+
+```{r panel-cands}
+PANEL_HITS_FDR10 <- file.path(OUT_BASE,
+  "dream_individual_baseAge55/panel_subsets/dream_panel_hits_fdr10.csv")
+
+panel_hits <- if (file.exists(PANEL_HITS_FDR10)) {
+  readr::read_csv(PANEL_HITS_FDR10, show_col_types = FALSE) %>%
+    transmute(
+      panel,
+      SomaKey,
+      label          = if_else(is.na(Target) | Target == "", SomaKey, Target),
+      comparison     = contrast_title,
+      comparison_key = str_replace_all(comparison, "[^A-Za-z0-9]+", "_") %>%
+                       str_replace_all("^_|_$", ""),
+      logFC,
+      q_disc         = panel_adj.P.Val,
+      source         = "panel_individual",
+      sex            = NA_character_,
+      EntrezGeneSymbol
+    )
+} else {
+  warning("Panel hits FDR10 file missing: ", PANEL_HITS_FDR10)
+  tibble()
+}
+
+extract_candidates <- function(tbl, alpha_fdr = 0.10) {
+  tbl %>%
+    filter(!is.na(q_disc), q_disc < alpha_fdr) %>%
+    distinct(SomaKey, comparison, source, .keep_all = TRUE)
+}
+```
+
+```{r run-panel-fn}
+fit_one_pair <- function(somakey,
+                         biom,
+                         df,
+                         adjust_for_group = TRUE,
+                         age_terms = AGE_TERMS,
+                         biomarker_scale = c("log2", "raw")) {
+  biomarker_scale <- match.arg(biomarker_scale)
+  missing_age <- setdiff(age_terms, names(df))
+  if (length(missing_age) > 0L) {
+    stop("Missing age adjustment column(s): ", paste(missing_age, collapse = ", "))
+  }
+
+  df_cc <- df %>%
+    select(SubjectID, all_of(age_terms), Sex, group_individual,
+           y = all_of(somakey), x = all_of(biom)) %>%
+    filter(!is.na(y), !is.na(x), if_all(all_of(age_terms), ~ !is.na(.x)),
+           !is.na(Sex), !is.na(SubjectID))
+  if (adjust_for_group) {
+    df_cc <- df_cc %>% filter(!is.na(group_individual))
+  }
+  if (nrow(df_cc) < 10L) return(NULL)
+
+  if (biomarker_scale == "log2") {
+    if (any(df_cc$x <= 0, na.rm = TRUE)) return(NULL)
+    df_cc <- df_cc %>% mutate(x_model = log2(x))
+  } else {
+    df_cc <- df_cc %>% mutate(x_model = x)
+  }
+  if (n_distinct(df_cc$x_model) < 2L) return(NULL)
+  df_cc$Sex              <- droplevels(df_cc$Sex)
+  df_cc$group_individual <- droplevels(df_cc$group_individual)
+
+  fixed <- c("x_model", age_terms)
+  if (nlevels(df_cc$Sex) >= 2)              fixed <- c(fixed, "Sex")
+  if (adjust_for_group && nlevels(df_cc$group_individual) >= 2) {
+    fixed <- c(fixed, "group_individual")
+  }
+  has_rep <- any(table(df_cc$SubjectID) > 1)
+  fml_txt <- paste("y ~", paste(fixed, collapse = " + "),
+                   if (has_rep) "+ (1|SubjectID)" else "")
+  fit <- try(if (has_rep) lmer(as.formula(fml_txt), data = df_cc, REML = FALSE)
+             else         lm(as.formula(fml_txt), data = df_cc),
+             silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+
+  tt <- if (inherits(fit, "lmerMod")) broom.mixed::tidy(fit, effects = "fixed")
+        else                          broom::tidy(fit)
+  tt %>%
+    filter(term == "x_model") %>%
+    transmute(SomaKey   = somakey,
+              biomarker = biom,
+              biomarker_scale = biomarker_scale,
+              adjust_for_group = adjust_for_group,
+              age_adjustment = paste(age_terms, collapse = " + "),
+              beta      = estimate,
+              se        = std.error,
+              p         = p.value,
+              n_obs     = nrow(df_cc),
+              n_subj    = n_distinct(df_cc$SubjectID),
+              model     = if (has_rep) "lmer" else "lm",
+              model_formula = fml_txt)
+}
+
+run_panel <- function(cand_tbl,
+                      samp_tbl_bio,
+                      bio = BIO,
+                      protein_label_map,
+                      out_tag,
+                      alpha_fdr = 0.10,
+                      n_top = 8,
+                      keep_comparisons = NULL,
+                      adjust_for_group = TRUE,
+                      age_terms = AGE_TERMS,
+                      biomarker_scale = c("log2", "raw"),
+                      make_heatmap = TRUE,
+                      make_scatter = TRUE) {
+
+  biomarker_scale <- match.arg(biomarker_scale)
+  if (!is.null(keep_comparisons)) {
+    cand_tbl <- cand_tbl %>%
+      filter(comparison %in% setdiff(unique(keep_comparisons), "None"))
+    if (nrow(cand_tbl) == 0L)
+      stop("After keep_comparisons filter, no discovery candidates remain.")
+  }
+  present_keys <- intersect(unique(cand_tbl$SomaKey), names(samp_tbl_bio))
+  if (length(present_keys) == 0L) {
+    stop("None of the discovery SomaKeys are columns in the analytical table.")
+  }
+  cand_tbl <- cand_tbl %>% filter(SomaKey %in% present_keys)
+  pair_grid <- expand_grid(SomaKey = unique(cand_tbl$SomaKey), biomarker = bio)
+  res_lmm <- map2_dfr(pair_grid$SomaKey, pair_grid$biomarker,
+                      ~ fit_one_pair(.x, .y, samp_tbl_bio,
+                                     adjust_for_group = adjust_for_group,
+                                     age_terms = age_terms,
+                                     biomarker_scale = biomarker_scale))
+  if (nrow(res_lmm) == 0L) stop("All LMM fits returned NULL.")
+  res_lmm <- res_lmm %>%
+    mutate(q = p.adjust(p, method = "BH"))
+  lbl <- protein_label_map %>% select(SomaKey, Target, EntrezGeneSymbol)
+  res_lmm <- res_lmm %>%
+    left_join(lbl, by = "SomaKey") %>%
+    mutate(
+      ProteinLabel = if_else(is.na(Target) | Target == "", SomaKey, Target),
+      colname      = paste0(ProteinLabel, "__", SomaKey)
+    )
+  if (make_heatmap) {
+    beta_mat <- res_lmm %>%
+      select(biomarker, colname, beta) %>%
+      pivot_wider(names_from = colname, values_from = beta) %>%
+      arrange(match(biomarker, bio)) %>%
+      column_to_rownames("biomarker") %>%
+      as.matrix()
+
+    q_mat <- res_lmm %>%
+      select(biomarker, colname, q) %>%
+      pivot_wider(names_from = colname, values_from = q,
+                  values_fn = list(q = mean)) %>%
+      arrange(match(biomarker, bio)) %>%
+      column_to_rownames("biomarker") %>%
+      as.matrix()
+
+    stars  <- ifelse(!is.na(q_mat) & q_mat < alpha_fdr, "*", "")
+    mx     <- max(abs(beta_mat), na.rm = TRUE)
+    if (!is.finite(mx) || mx == 0) mx <- 1e-6
+    bk     <- seq(-mx, mx, length.out = 101)
+    pal    <- colorRampPalette(c("#2166AC", "white", "#B2182B"))(100)
+    lbl_col <- str_replace(colnames(beta_mat), "__SL\\d+.*$", "")
+    col_to_key <- res_lmm %>% distinct(colname, SomaKey)
+    ann_src <- cand_tbl %>%
+      group_by(SomaKey) %>%
+      summarise(
+        comp_combined = {
+          x <- sort(unique(comparison[source == "combined"]))
+          if (length(x) == 0) "None" else paste(x, collapse = " | ")
+        },
+        comp_individual = {
+          x <- sort(unique(comparison[source == "individual" |
+                                      source == "panel_individual"]))
+          if (length(x) == 0) "None" else paste(x, collapse = " | ")
+        },
+        comp_F = {
+          x <- sort(unique(comparison[!is.na(sex) & sex == "F"]))
+          if (length(x) == 0) "None" else paste(x, collapse = " | ")
+        },
+        comp_M = {
+          x <- sort(unique(comparison[!is.na(sex) & sex == "M"]))
+          if (length(x) == 0) "None" else paste(x, collapse = " | ")
+        },
+        .groups = "drop"
+      ) %>%
+      inner_join(col_to_key, by = "SomaKey")
+
+    ann_col <- tibble(colname = colnames(beta_mat)) %>%
+      left_join(ann_src, by = "colname") %>%
+      mutate(across(starts_with("comp_"), ~ replace_na(.x, "None"))) %>%
+      column_to_rownames("colname") %>%
+      as.data.frame() %>%
+      select(comp_combined, comp_individual, comp_F, comp_M)
+    drop_uniform <- function(df, cn) {
+      if (cn %in% names(df) && length(unique(df[[cn]])) <= 1L) df[[cn]] <- NULL
+      df
+    }
+    ann_col <- drop_uniform(ann_col, "comp_F")
+    ann_col <- drop_uniform(ann_col, "comp_M")
+
+    base_comp_colors <- c(
+      "AD vs HC"            = "#0072B2",
+      "MCI vs HC"           = "#CC79A7",
+      "LBD vs HC"           = "#D55E00",
+      "MCI-PD vs HC"        = "#009E73",
+      "PD vs HC"            = "#B8860B",
+      "AD_spectrum vs HC"   = "#1B4F8C",
+      "LB_spectrum vs HC"   = "#8C2A00",
+      "None"                = "grey90"
+    )
+    uniq_levels <- unique(unlist(lapply(ann_col, function(x)
+      if (is.null(x)) character() else as.character(unique(x)))))
+    level_colors <- setNames(base_comp_colors[uniq_levels], uniq_levels)
+    level_colors[is.na(level_colors)] <- "grey80"
+    ann_colors <- setNames(
+      lapply(names(ann_col), function(cn) level_colors[unique(ann_col[[cn]])]),
+      names(ann_col)
+    )
+
+    group_label <- if (adjust_for_group) "group-adjusted" else "no group adjustment"
+    scale_label <- if (biomarker_scale == "log2") "log2 biomarker" else "raw biomarker"
+    pheatmap(
+      beta_mat, color = pal, breaks = bk,
+      cluster_rows = FALSE, cluster_cols = TRUE,
+      annotation_col = if (ncol(ann_col) > 0) ann_col else NA,
+      annotation_colors = ann_colors,
+      labels_col = lbl_col, display_numbers = stars,
+      number_color = "black", number_cex = 3,
+      main = paste0(out_tag, " LMM (log2 protein ~ ", scale_label, "; ",
+                    group_label, "; * q<", alpha_fdr, ")"),
+      filename = paste0("heatmap_", out_tag, "_v2.pdf"),
+      width = 8, height = 5
+    )
+  }
+  disc_meta <- cand_tbl %>%
+    group_by(SomaKey) %>%
+    summarise(
+      discovery   = paste(unique(paste0(source, ":", comparison)),
+                          collapse = " | "),
+      min_q_disc  = suppressWarnings(min(q_disc, na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(min_q_disc = if_else(is.infinite(min_q_disc), NA_real_, min_q_disc))
+
+  assoc_tbl <- res_lmm %>%
+    mutate(ci_low = beta - 1.96 * se,
+           ci_high = beta + 1.96 * se) %>%
+    left_join(disc_meta, by = "SomaKey") %>%
+    select(ProteinLabel, EntrezGeneSymbol, SomaKey,
+           discovery, min_q_disc,
+           biomarker, biomarker_scale,
+           beta, se, ci_low, ci_high,
+           p, q, n_obs, n_subj,
+           adjust_for_group, age_adjustment, model, model_formula) %>%
+    arrange(q, desc(abs(beta)))
+  write_csv(assoc_tbl,
+            paste0("protein_biomarker_associations_", out_tag, "_v2.csv"))
+  top_pairs <- assoc_tbl %>%
+    filter(!is.na(q)) %>% arrange(q, desc(abs(beta))) %>% slice_head(n = n_top)
+
+  plot_marginal <- function(df, somakey, prot_label, biomarker) {
+    df_cc <- df %>%
+      select(SubjectID, all_of(age_terms), Sex, group_individual,
+             y = all_of(somakey), x = all_of(biomarker)) %>%
+      filter(!is.na(y), !is.na(x), if_all(all_of(age_terms), ~ !is.na(.x)),
+             !is.na(Sex), !is.na(SubjectID))
+    if (adjust_for_group) {
+      df_cc <- df_cc %>% filter(!is.na(group_individual))
+    }
+    if (biomarker_scale == "log2") {
+      df_cc <- df_cc %>% filter(x > 0) %>% mutate(x_model = log2(x))
+    } else {
+      df_cc <- df_cc %>% mutate(x_model = x)
+    }
+    df_cc$Sex              <- droplevels(factor(df_cc$Sex))
+    df_cc$group_individual <- droplevels(factor(df_cc$group_individual))
+
+    fixed <- c("x_model", age_terms)
+    include_sex <- nlevels(df_cc$Sex) >= 2
+    include_group <- adjust_for_group && nlevels(df_cc$group_individual) >= 2
+    if (include_sex) fixed <- c(fixed, "Sex")
+    if (include_group) fixed <- c(fixed, "group_individual")
+    has_rep <- any(table(df_cc$SubjectID) > 1)
+    fml_txt <- paste("y ~", paste(fixed, collapse = " + "),
+                     if (has_rep) "+ (1|SubjectID)" else "")
+    fit <- if (has_rep) lmer(as.formula(fml_txt), data = df_cc, REML = FALSE)
+           else         lm(as.formula(fml_txt), data = df_cc)
+
+    grid <- tibble(
+      x_model = seq(min(df_cc$x_model), max(df_cc$x_model), length.out = 100)
+    )
+    for (age_term in age_terms) {
+      grid[[age_term]] <- mean(df_cc[[age_term]], na.rm = TRUE)
+    }
+    if (include_sex) {
+      grid$Sex <- names(sort(table(df_cc$Sex), decreasing = TRUE))[1]
+    }
+    if (include_group) {
+      grid$group_individual <- names(sort(table(df_cc$group_individual),
+                                          decreasing = TRUE))[1]
+    }
+    if (has_rep) {
+      grid$SubjectID <- df_cc$SubjectID[1]
+      grid$pred      <- predict(fit, newdata = grid, re.form = NA)
+    } else {
+      grid$pred      <- predict(fit, newdata = grid)
+    }
+
+    est <- if (inherits(fit, "lmerMod")) broom.mixed::tidy(fit, effects = "fixed")
+           else                          broom::tidy(fit)
+    est <- est %>% filter(term == "x_model") %>% slice(1)
+
+    x_axis_label <- if (biomarker_scale == "log2") {
+      paste0(biomarker, " (log2)")
+    } else {
+      paste0(biomarker, " (raw)")
+    }
+    group_label <- if (adjust_for_group) "group-adjusted" else "no group adjustment"
+    ggplot(df_cc, aes(x = x_model, y = y)) +
+      geom_point(alpha = 0.25, size = 1.2) +
+      geom_line(data = grid, aes(x = x_model, y = pred),
+                linewidth = 1, alpha = 0.85, color = "#09637E") +
+      theme_classic(base_size = 14) +
+      labs(
+        title = paste0(prot_label, " vs ", biomarker),
+        subtitle = paste0("LMM (", group_label, "): β=", round(est$estimate, 3),
+                          ", p=", signif(est$p.value, 3),
+                          " | n_obs=", nrow(df_cc),
+                          ", n_subj=", n_distinct(df_cc$SubjectID)),
+        x = x_axis_label,
+        y = paste0(prot_label, " (log2 RFU)")
+      )
+  }
+
+  if (make_scatter && nrow(top_pairs) > 0L) {
+    out_dir <- paste0("top_pair_plots_", out_tag, "_v2")
+    dir.create(out_dir, showWarnings = FALSE)
+    for (i in seq_len(nrow(top_pairs))) {
+      p <- plot_marginal(samp_tbl_bio,
+                         top_pairs$SomaKey[i],
+                         top_pairs$ProteinLabel[i],
+                         top_pairs$biomarker[i])
+      ggsave(file.path(out_dir,
+                       paste0("scatter_", i, "_",
+                              make.names(top_pairs$ProteinLabel[i]),
+                              "_vs_", top_pairs$biomarker[i], ".png")),
+             plot = p, width = 5.5, height = 4.5, dpi = 300)
+    }
+  }
+
+  invisible(list(cand_tbl = cand_tbl,
+                 res_lmm  = res_lmm,
+                 assoc_tbl = assoc_tbl,
+                 top_pairs = top_pairs))
+}
+
+format_sensitivity_comparison <- function(main_tbl,
+                                          sensitivity_tbl,
+                                          sensitivity_label) {
+  if (is.null(sensitivity_tbl) || nrow(sensitivity_tbl) == 0L) return(tibble())
+
+  main_comp <- main_tbl %>%
+    select(ProteinLabel, EntrezGeneSymbol, SomaKey, biomarker,
+           beta_main = beta, p_main = p, q_main = q,
+           n_obs_main = n_obs, n_subj_main = n_subj,
+           main_biomarker_scale = biomarker_scale,
+           main_adjust_for_group = adjust_for_group,
+           main_age_adjustment = age_adjustment)
+
+  sens_comp <- sensitivity_tbl %>%
+    select(SomaKey, biomarker,
+           beta_sensitivity = beta, p_sensitivity = p, q_sensitivity = q,
+           n_obs_sensitivity = n_obs, n_subj_sensitivity = n_subj,
+           sensitivity_biomarker_scale = biomarker_scale,
+           sensitivity_adjust_for_group = adjust_for_group,
+           sensitivity_age_adjustment = age_adjustment)
+
+  main_comp %>%
+    inner_join(sens_comp, by = c("SomaKey", "biomarker")) %>%
+    mutate(
+      sensitivity = sensitivity_label,
+      beta_delta = if_else(main_biomarker_scale == sensitivity_biomarker_scale,
+                           beta_sensitivity - beta_main,
+                           NA_real_),
+      same_direction = sign(beta_main) == sign(beta_sensitivity),
+      main_q_lt_0_10 = q_main < 0.10,
+      sensitivity_q_lt_0_10 = q_sensitivity < 0.10,
+      q_crosses_0_10 = main_q_lt_0_10 != sensitivity_q_lt_0_10
+    ) %>%
+    arrange(sensitivity, q_main, q_sensitivity, desc(abs(beta_main)))
+}
+
+write_sensitivity_comparisons <- function(out_tag,
+                                          main_assoc,
+                                          no_group_assoc = NULL,
+                                          ab_ratio_raw_assoc = NULL) {
+  comparisons <- bind_rows(
+    format_sensitivity_comparison(main_assoc, no_group_assoc,
+                                  "omit_group_individual"),
+    format_sensitivity_comparison(main_assoc, ab_ratio_raw_assoc,
+                                  "raw_PlasmaABRatio")
+  )
+  if (nrow(comparisons) > 0L) {
+    write_csv(comparisons,
+              paste0("protein_biomarker_associations_", out_tag,
+                     "_sensitivity_compare_v2.csv"))
+  }
+  invisible(comparisons)
+}
+```
+
+```{r run-bone}
+if (isTRUE(get0("SKIP_RMD_PANEL_RUNS", ifnotfound = FALSE))) {
+  message("Skipping bone panel run because SKIP_RMD_PANEL_RUNS is TRUE.")
+} else {
+panel_bone <- panel_hits %>% filter(panel == "bone")
+bone_panel_somakeys <- unique(panel_bone$SomaKey)
+
+cand_bone <- bind_rows(
+  panel_bone,
+  extract_candidates(dream_all, alpha_fdr = 0.10) %>%
+    filter(SomaKey %in% bone_panel_somakeys)
+) %>%
+  distinct(SomaKey, comparison, source, .keep_all = TRUE)
+
+message(sprintf("Bone discovery candidates: %d unique SomaKeys (%d rows).",
+                n_distinct(cand_bone$SomaKey), nrow(cand_bone)))
+
+bone_out <- run_panel(
+  cand_tbl          = cand_bone,
+  samp_tbl_bio      = samp_tbl_bio,
+  bio               = BIO,
+  protein_label_map = protein_label_map,
+  out_tag           = "bone",
+  alpha_fdr         = 0.10,
+  n_top             = 8,
+  adjust_for_group  = TRUE,
+  age_terms         = AGE_TERMS,
+  biomarker_scale   = "log2"
+)
+
+bone_no_group_out <- if (RUN_GROUP_SENSITIVITY) {
+  run_panel(
+    cand_tbl          = cand_bone,
+    samp_tbl_bio      = samp_tbl_bio,
+    bio               = BIO,
+    protein_label_map = protein_label_map,
+    out_tag           = "bone_no_group",
+    alpha_fdr         = 0.10,
+    n_top             = 0,
+    adjust_for_group  = FALSE,
+    age_terms         = AGE_TERMS,
+    biomarker_scale   = "log2",
+    make_heatmap      = TRUE,
+    make_scatter      = FALSE
+  )
+} else NULL
+
+bone_ab_ratio_raw_out <- if (RUN_AB_RATIO_RAW_SENSITIVITY) {
+  run_panel(
+    cand_tbl          = cand_bone,
+    samp_tbl_bio      = samp_tbl_bio,
+    bio               = "PlasmaABRatio",
+    protein_label_map = protein_label_map,
+    out_tag           = "bone_abratio_raw",
+    alpha_fdr         = 0.10,
+    n_top             = 0,
+    adjust_for_group  = TRUE,
+    age_terms         = AGE_TERMS,
+    biomarker_scale   = "raw",
+    make_heatmap      = FALSE,
+    make_scatter      = FALSE
+  )
+} else NULL
+
+bone_sensitivity_compare <- write_sensitivity_comparisons(
+  out_tag            = "bone",
+  main_assoc         = bone_out$assoc_tbl,
+  no_group_assoc     = bone_no_group_out$assoc_tbl,
+  ab_ratio_raw_assoc = bone_ab_ratio_raw_out$assoc_tbl
+)
+}
+```
+
+```{r run-senescence}
+if (isTRUE(get0("SKIP_RMD_PANEL_RUNS", ifnotfound = FALSE))) {
+  message("Skipping senescence panel run because SKIP_RMD_PANEL_RUNS is TRUE.")
+} else {
+panel_sen <- panel_hits %>% filter(panel == "senescence")
+sen_panel_somakeys <- unique(panel_sen$SomaKey)
+
+cand_sen <- bind_rows(
+  panel_sen,
+  extract_candidates(dream_all, alpha_fdr = 0.10) %>%
+    filter(SomaKey %in% sen_panel_somakeys)
+) %>%
+  distinct(SomaKey, comparison, source, .keep_all = TRUE)
+
+message(sprintf("Senescence discovery candidates: %d unique SomaKeys (%d rows).",
+                n_distinct(cand_sen$SomaKey), nrow(cand_sen)))
+
+senescence_out <- run_panel(
+  cand_tbl          = cand_sen,
+  samp_tbl_bio      = samp_tbl_bio,
+  bio               = BIO,
+  protein_label_map = protein_label_map,
+  out_tag           = "senescence",
+  alpha_fdr         = 0.10,
+  n_top             = 8,
+  adjust_for_group  = TRUE,
+  age_terms         = AGE_TERMS,
+  biomarker_scale   = "log2"
+)
+
+senescence_no_group_out <- if (RUN_GROUP_SENSITIVITY) {
+  run_panel(
+    cand_tbl          = cand_sen,
+    samp_tbl_bio      = samp_tbl_bio,
+    bio               = BIO,
+    protein_label_map = protein_label_map,
+    out_tag           = "senescence_no_group",
+    alpha_fdr         = 0.10,
+    n_top             = 0,
+    adjust_for_group  = FALSE,
+    age_terms         = AGE_TERMS,
+    biomarker_scale   = "log2",
+    make_heatmap      = TRUE,
+    make_scatter      = FALSE
+  )
+} else NULL
+
+senescence_ab_ratio_raw_out <- if (RUN_AB_RATIO_RAW_SENSITIVITY) {
+  run_panel(
+    cand_tbl          = cand_sen,
+    samp_tbl_bio      = samp_tbl_bio,
+    bio               = "PlasmaABRatio",
+    protein_label_map = protein_label_map,
+    out_tag           = "senescence_abratio_raw",
+    alpha_fdr         = 0.10,
+    n_top             = 0,
+    adjust_for_group  = TRUE,
+    age_terms         = AGE_TERMS,
+    biomarker_scale   = "raw",
+    make_heatmap      = FALSE,
+    make_scatter      = FALSE
+  )
+} else NULL
+
+senescence_sensitivity_compare <- write_sensitivity_comparisons(
+  out_tag            = "senescence",
+  main_assoc         = senescence_out$assoc_tbl,
+  no_group_assoc     = senescence_no_group_out$assoc_tbl,
+  ab_ratio_raw_assoc = senescence_ab_ratio_raw_out$assoc_tbl
+)
+}
+```
+
+```{r sessioninfo}
+sessionInfo()
+```

@@ -1,0 +1,5 @@
+source,id,match_draw_date,only_if_visit_missing,visit_n,draw_date
+tau217,1000001,2020-01-15,false,2,
+tau217,1000002,2018-06-30,false,2,
+tau181,1000003,,true,1,
+tau181,1000004,2021-03-10,false,,2019-03-10
